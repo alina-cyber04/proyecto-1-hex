@@ -1,22 +1,23 @@
 """
-SmartPlayer for HEX using MC-RAVE (Monte Carlo Tree Search with RAVE)
+SmartPlayer for HEX using MC-RAVE with incremental Union-Find and MAST sampling
 
-Implements an autonomous AI agent that plays HEX using:
-- MC-RAVE algorithm: combines UCT with AMAF (All Moves As First) statistics
+- MC-RAVE: Monte Carlo Tree Search with AMAF statistics
 - Incremental Union-Find: fast win detection via virtual nodes
-- Strategic move selection: center → winning move → threat blocking → MCTS
+- MAST: learns move quality from playouts using Boltzmann sampling
 """
 
 from player import Player
 from board import HexBoard
-import time, math, random
+import time, math, random, copy
 from collections import deque
 
 # Search parameters
 TIME_LIMIT    = 4.5
-EXPLORATION_C = 0.0  # Pure exploitation (RAVE handles exploration)
+EXPLORATION_C = 1.41  # √2 standard UCT value (enables exploration + RAVE balancing)
 RAVE_BIAS     = 0.00913  # Balance between UCT and AMAF statistics
 FPU           = 0.35  # First-Play Urgency for untried moves
+MAST_TEMPERATURE = 0.5  # Balanced Boltzmann temperature for playout diversity
+LGR_RANDOMNESS = 0.15  # Reduced: more exploitative late-game
 
 # Hexagonal adjacency directions (even-r offset coordinate system)
 _DIRS_EVEN = ((-1,-1),(-1,0),(0,-1),(0,1),(1,-1),(1,0))
@@ -104,13 +105,59 @@ def check_win(grid, player_id, size):
                 queue.append((nr,nc)); visited.add((nr,nc))
     return False
 
+
+def _find_decisive_moves(grid, size, player_id):
+    """Find winning move and blocking move using Union-Find.
+    
+    Tests each empty cell to detect if placement wins or blocks opponent.
+    Returns immediately when decisive move found.
+    """
+    opp_id = 3 - player_id
+    uf_own = HexUnionFind(size)
+    uf_opp = HexUnionFind(size)
+    
+    for r in range(size):
+        for c in range(size):
+            p = grid[r][c]
+            if p == player_id:
+                uf_own.place(r, c, player_id, grid)
+            elif p == opp_id:
+                uf_opp.place(r, c, opp_id, grid)
+    for r in range(size):
+        for c in range(size):
+            if grid[r][c] != 0:
+                continue
+            
+            parent_own_save = uf_own.parent[:]
+            rank_own_save = uf_own.rank[:]
+            uf_own.place(r, c, player_id, grid)
+            
+            if (player_id == 1 and uf_own.p1_wins()) or (player_id == 2 and uf_own.p2_wins()):
+                return (r, c), None
+            
+            uf_own.parent = parent_own_save
+            uf_own.rank = rank_own_save
+            
+            parent_opp_save = uf_opp.parent[:]
+            rank_opp_save = uf_opp.rank[:]
+            uf_opp.place(r, c, opp_id, grid)
+            
+            if (opp_id == 1 and uf_opp.p1_wins()) or (opp_id == 2 and uf_opp.p2_wins()):
+                return None, (r, c)
+            
+            uf_opp.parent = parent_opp_save
+            uf_opp.rank = rank_opp_save
+    
+    return None, None
+
 class MCTSNode:
-    """Node in MCTS tree with MC-RAVE (AMAF) statistics and incremental empty cells."""
+    """Node in MCTS tree with MC-RAVE (AMAF) statistics and incremental Union-Find."""
     __slots__ = ('move','player','parent','children',
                  'visits','wins','visits_amaf','wins_amaf',
-                 'untried_moves','empty')
+                 'untried_moves','empty','uf1','uf2')
 
-    def __init__(self, move, player, parent, legal_moves):
+    def __init__(self, move, player, parent, legal_moves, grid=None, size=None,
+                 parent_uf1=None, parent_uf2=None):
         self.move          = move
         self.player        = player
         self.parent        = parent
@@ -122,6 +169,20 @@ class MCTSNode:
         self.empty         = list(legal_moves)
         self.untried_moves = list(legal_moves)
         random.shuffle(self.untried_moves)
+        
+        if parent_uf1 is not None and move is not None:
+            self.uf1 = copy.deepcopy(parent_uf1)
+            self.uf2 = copy.deepcopy(parent_uf2)
+            r, c = move
+            if player == 1:
+                self.uf1.place(r, c, 1, grid)
+            else:
+                self.uf2.place(r, c, 2, grid)
+        elif grid is not None and size is not None:
+            self.uf1, self.uf2 = _build_uf_from_grid(grid, size)
+        else:
+            self.uf1 = None
+            self.uf2 = None
 
     def rave_value(self):
         if self.visits==0:
@@ -170,15 +231,22 @@ def _fast_rollout(grid, size, start_player, empty_list):
     return (1 if uf1.p1_wins() else 2), moves_by_player
 
 class MCTSTree:
-    """MC-RAVE search engine: combines tree search with rapid playouts."""
+    """MC-RAVE search engine with MAST sampling: learns from playout statistics."""
 
     def __init__(self, player_id, grid, size):
         self.player_id = player_id
         self.size      = size
         self.root_grid = [row[:] for row in grid]
         legal = [(r,c) for r in range(size) for c in range(size) if grid[r][c]==0]
-        self.root = MCTSNode(move=None, player=None, parent=None, legal_moves=legal)
+        self.root = MCTSNode(move=None, player=None, parent=None, legal_moves=legal,
+                             grid=grid, size=size)
         self.root.visits = 1
+        
+        # MAST statistics indexed by (player, move) to avoid cross-player leakage.
+        self.mast_wins   = {}  # (player, move) -> wins
+        self.mast_total  = {}  # (player, move) -> total trials
+        self.mast_tau    = MAST_TEMPERATURE
+        self.lgr         = {1: {}, 2: {}}  # lgr[player][opponent_last_move] = reply_move
 
     def search(self, time_limit):
         deadline = time.time()+time_limit
@@ -191,6 +259,102 @@ class MCTSTree:
     def best_move(self):
         if not self.root.children: return None
         return self.root.most_visited_child().move
+
+    def _mast_weight(self, player, move):
+        """Boltzmann weight for a (player, move) pair."""
+        key = (player, move)
+        total = self.mast_total.get(key, 0)
+        wins = self.mast_wins.get(key, 0)
+        q = (wins / total) if total > 0 else 0.5
+        return math.exp(q / self.mast_tau)
+
+    def _mast_pick(self, legal_moves, player):
+        """Pick one legal move for the current player using MAST weights."""
+        if not legal_moves:
+            return None
+        weights = [self._mast_weight(player, mv) for mv in legal_moves]
+        total_w = sum(weights)
+        if total_w <= 0:
+            return random.choice(legal_moves)
+        r_val = random.random() * total_w
+        cumsum = 0.0
+        for idx, w in enumerate(weights):
+            cumsum += w
+            if r_val < cumsum:
+                return legal_moves[idx]
+        return legal_moves[-1]
+
+    def _bridge_response(self, sim_grid, size, last_move, player, legal):
+        """Detect threatened local bridge carriers and return a repair move if any."""
+        if last_move is None:
+            return None
+        r, c = last_move
+        neighbors = get_neighbors(r, c, size)
+
+        for i, n1 in enumerate(neighbors):
+            for n2 in neighbors[i + 1:]:
+                r1, c1 = n1
+                r2, c2 = n2
+
+                if sim_grid[r1][c1] != player or sim_grid[r2][c2] != player:
+                    continue
+
+                neigh1 = set(get_neighbors(r1, c1, size))
+                neigh2 = set(get_neighbors(r2, c2, size))
+                carriers = (neigh1 & neigh2) - {(r, c)}
+
+                for ro, co in carriers:
+                    if sim_grid[ro][co] == 0 and (ro, co) in legal:
+                        return (ro, co)
+        return None
+
+    def rollout(self, sim_grid, size, start_player, empty_list,
+                node_uf1, node_uf2):
+        """Turn-by-turn playout with player-specific MAST and Union-Find."""
+        uf1 = copy.deepcopy(node_uf1)
+        uf2 = copy.deepcopy(node_uf2)
+        legal = set(empty_list)
+        
+        moves_by_player = {1:[], 2:[]}
+        player = start_player
+        last_move = None
+        
+        while legal:
+            mv = None
+
+            # Priority 1: bridge response.
+            mv = self._bridge_response(sim_grid, size, last_move, player, legal)
+
+            # Priority 2: stochastic LGR reply to opponent's latest move.
+            if mv is None and last_move is not None:
+                cand = self.lgr[player].get(last_move)
+                if cand is not None and cand in legal:
+                    if random.random() > LGR_RANDOMNESS:
+                        mv = cand
+
+            # Priority 3: player-specific MAST.
+            if mv is None:
+                mv = self._mast_pick(list(legal), player)
+
+            r, c = mv
+            legal.discard(mv)
+
+            sim_grid[r][c] = player
+            moves_by_player[player].append(mv)
+            
+            if player == 1:
+                uf1.place(r, c, 1, sim_grid)
+                if uf1.p1_wins():
+                    return 1, moves_by_player
+            else:
+                uf2.place(r, c, 2, sim_grid)
+                if uf2.p2_wins():
+                    return 2, moves_by_player
+            
+            last_move = mv
+            player = 3 - player
+        
+        return (1 if uf1.p1_wins() else 2), moves_by_player
 
     def _run_iteration(self):
         # Selection: traverse best path until unfully-expanded node
@@ -212,14 +376,17 @@ class MCTSTree:
             sim_grid[r][c] = current_player
             legal_child = [m for m in node.empty if m != move]
             child = MCTSNode(move=move, player=current_player,
-                             parent=node, legal_moves=legal_child)
+                             parent=node, legal_moves=legal_child,
+                             grid=sim_grid, size=self.size,
+                             parent_uf1=node.uf1, parent_uf2=node.uf2)
             node.children[move] = child
             node           = child
             current_player = 3-current_player
 
-        # Simulation: fast random playout from new node
-        winner, moves_by_player = _fast_rollout(
-            sim_grid, self.size, current_player, node.empty
+        # Simulation: fast playout
+        winner, moves_by_player = self.rollout(
+            sim_grid, self.size, current_player, node.empty,
+            node.uf1, node.uf2
         )
 
         # Backpropagation: update statistics along path
@@ -241,11 +408,40 @@ class MCTSTree:
                         if child.player==winner:
                             child.wins_amaf += 1.0
             current = current.parent
+        
+        # Update MAST statistics after backpropagation completes
+        for player_id, moves in moves_by_player.items():
+            for move in moves:
+                key = (player_id, move)
+                self.mast_total[key] = self.mast_total.get(key, 0) + 1
+                if player_id == winner:
+                    self.mast_wins[key] = self.mast_wins.get(key, 0) + 1
+
+        # Update LGR table from winning replies.
+        seq1 = moves_by_player[1]
+        seq2 = moves_by_player[2]
+        if winner == 1:
+            offset = 1 if self.player_id == 1 else 0
+            skip = 1 if len(seq1) > len(seq2) else 0
+            for i in range(len(seq2) - skip):
+                if i + offset < len(seq1):
+                    self.lgr[1][seq2[i]] = seq1[i + offset]
+        else:
+            offset = 1 if self.player_id == 2 else 0
+            skip = 1 if len(seq2) > len(seq1) else 0
+            for i in range(len(seq1) - skip):
+                if i + offset < len(seq2):
+                    self.lgr[2][seq1[i]] = seq2[i + offset]
+
 
 class SmartPlayer(Player):
-    """Autonomous HEX player using MC-RAVE algorithm.
+    """Autonomous HEX player using MC-RAVE + MAST algorithm.
     
-    Strategy: center move → winning move → block threat → MCTS search (4.5s)
+    Strategy: 
+    1. Center opening
+    2. Winning move detection
+    3. Block opponent threat
+    4. MCTS search with MAST sampling
     """
     def __init__(self, player_id):
         super().__init__(player_id)
@@ -253,32 +449,22 @@ class SmartPlayer(Player):
     def play(self, board):
         size   = board.size
         grid   = board.board
-        opp_id = 3-self.player_id
         legal  = [(r,c) for r in range(size) for c in range(size) if grid[r][c]==0]
         
-        # Handle edge cases
         if not legal:
             raise ValueError("No moves available")
         if len(legal) == 1:
             return legal[0]
         if len(legal) == size*size:
-            return (size//2, size//2)  # Center opening
+            return (size//2, size//2)
         
-        # Check for immediate winning move
-        for r,c in legal:
-            test = [row[:] for row in grid]
-            test[r][c] = self.player_id
-            if check_win(test, self.player_id, size):
-                return (r,c)
+        win_move, block_move = _find_decisive_moves(grid, size, self.player_id)
         
-        # Check for opponent threat to block
-        for r,c in legal:
-            test = [row[:] for row in grid]
-            test[r][c] = opp_id
-            if check_win(test, opp_id, size):
-                return (r,c)
+        if win_move is not None:
+            return win_move
+        if block_move is not None:
+            return block_move
         
-        # MC-RAVE search for best move
         mcts = MCTSTree(player_id=self.player_id, grid=grid, size=size)
         mcts.search(time_limit=TIME_LIMIT)
         best = mcts.best_move()
