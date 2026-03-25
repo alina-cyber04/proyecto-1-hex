@@ -13,11 +13,11 @@ from collections import deque
 
 # Search parameters
 TIME_LIMIT    = 4.5
-EXPLORATION_C = 1.41  # √2 standard UCT value (enables exploration + RAVE balancing)
+EXPLORATION_C = 0.0  # Pure exploitation (RAVE handles exploration)
 RAVE_BIAS     = 0.00913  # Balance between UCT and AMAF statistics
 FPU           = 0.35  # First-Play Urgency for untried moves
-MAST_TEMPERATURE = 0.5  # Balanced Boltzmann temperature for playout diversity
-LGR_RANDOMNESS = 0.15  # Reduced: more exploitative late-game
+MAST_TEMPERATURE = 0.3  # Lower tau increases MAST influence in rollout
+LGR_RANDOMNESS = 0.2  # Exploration probability: ignore LGR even when available
 
 # Hexagonal adjacency directions (even-r offset coordinate system)
 _DIRS_EVEN = ((-1,-1),(-1,0),(0,-1),(0,1),(1,-1),(1,0))
